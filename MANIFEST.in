@@ -1,2 +1,2 @@
-include src/open_flask_auth/schema.sql
+include open_flask_auth/schema.sql
 global-exclude *.pyc

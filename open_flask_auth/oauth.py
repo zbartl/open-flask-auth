@@ -22,6 +22,9 @@ class OpenFlaskAuth(object):
         self.key = secret
         self.audience = "http://localhost"
 
+    def register_routes(self):
+        app = self.app
+
         @app.route('/oauth2/token', methods=['POST'])
         def get_token():
             authz = request.authorization
@@ -38,6 +41,19 @@ class OpenFlaskAuth(object):
                 expires_in=expires.timestamp(),
                 scope=scope
             ), {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+        @app.route('/oauth2/revoke', methods=['POST'])
+        def revoke_token():
+            authz = request.authorization
+            token = request.form.get('token', None)
+            token_type_hint = request.form.get('token_type_hint', None)
+
+            if token is None:
+                abort(400)
+
+            self.revoke(authz.username, authz.password, token, token_type_hint)
+
+            return '', 204
 
     def enroll(self, user_id):
         error = None
@@ -69,32 +85,47 @@ class OpenFlaskAuth(object):
         raise EnrollmentError(error)
 
     def token(self, public_key, secret_key, scope):
-        error = None
+        self.validate_credentials(public_key, secret_key)
 
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        expires = now + datetime.timedelta(minutes=15)
+        encoded = jwt.encode({
+            "exp": expires,
+            "nbf": now,
+            "aud": "http://localhost",
+            "scp": scope,
+            "tid": str(uuid.uuid4())
+        }, self.key, algorithm="HS256")
+        return encoded, expires
+
+    def revoke(self, public_key, secret_key, token, token_type_hint):
+        self.validate_credentials(public_key, secret_key)
+        decoded = jwt.decode(token, self.key, algorithms='HS256', audience=self.audience)
+        token_id = decoded.get('tid', None)
+
+        if token_id is None:
+            abort(400)
+
+        try:
+            with self.app.app_context():
+                db = get_db()
+                db.execute(
+                    'INSERT into revocations (token_id, revoked_on) VALUES (?, ?)',
+                    (token_id, datetime.datetime.now(tz=datetime.timezone.utc))
+                )
+                db.commit()
+        except db.IntegrityError as e:
+            abort(400)
+
+    def validate_credentials(self, public_key, secret_key):
         with self.app.app_context():
             db = get_db()
             enrollment = db.execute(
                 'SELECT * FROM enrollments WHERE public_key = ?', (public_key,)
             ).fetchone()
 
-        if enrollment is None:
-            error = 'Unauthorized.'
-        elif not check_password_hash(enrollment['secret_hash'], secret_key):
-            error = 'Incorrect public / secret key.'
-
-        if error is None:
-            now = datetime.datetime.now(tz=datetime.timezone.utc)
-            expires = now + datetime.timedelta(minutes=15)
-            encoded = jwt.encode({
-                "exp": expires,
-                "nbf": now,
-                "aud": "http://localhost",
-                "scp": scope,
-                "tid": str(uuid.uuid4())
-            }, self.key, algorithm="HS256")
-            return encoded, expires
-
-        return error
+        if enrollment is None or not check_password_hash(enrollment['secret_hash'], secret_key):
+            abort(401)
 
     def require_token(self, scope):
         def wrapper(f):
@@ -106,10 +137,25 @@ class OpenFlaskAuth(object):
                 else:
                     authz_token = ""
                 if authz_token:
-                    decoded = jwt.decode(authz_token, self.key, algorithms="HS256",
+                    decoded = jwt.decode(authz_token, self.key, algorithms='HS256',
                                          audience=self.audience)
+                    token_id = decoded.get('tid', None)
+                    token_scope = decoded.get('scp', None)
 
-                    if decoded['scp'] != scope:
+                    if token_id is None:
+                        abort(400)
+
+                    if token_scope != scope:
+                        abort(401)
+
+                    with self.app.app_context():
+                        db = get_db()
+                        revoked = db.execute(
+                            'SELECT * FROM revocations WHERE token_id = ?', (token_id,)
+                        ).fetchone()
+
+                    if revoked is not None:
+                        print('Token ID has been revoked.')
                         abort(401)
 
                 else:

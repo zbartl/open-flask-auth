@@ -4,7 +4,7 @@ import os
 import uuid
 from base64 import b64encode
 
-from flask import request, jsonify
+from flask import request, jsonify, Blueprint
 from werkzeug.exceptions import abort
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
@@ -127,7 +127,7 @@ class OpenFlaskAuth(object):
         if enrollment is None or not check_password_hash(enrollment['secret_hash'], secret_key):
             abort(401)
 
-    def require_token(self, scope):
+    def require_oauth(self, scope):
         def wrapper(f):
             @functools.wraps(f)
             def decorator(**kwargs):
@@ -137,8 +137,12 @@ class OpenFlaskAuth(object):
                 else:
                     authz_token = ""
                 if authz_token:
-                    decoded = jwt.decode(authz_token, self.key, algorithms='HS256',
-                                         audience=self.audience)
+                    try:
+                        decoded = jwt.decode(authz_token, self.key, algorithms='HS256',
+                                             audience=self.audience)
+                    except jwt.ExpiredSignatureError:
+                        abort(401)
+
                     token_id = decoded.get('tid', None)
                     token_scope = decoded.get('scp', None)
 
